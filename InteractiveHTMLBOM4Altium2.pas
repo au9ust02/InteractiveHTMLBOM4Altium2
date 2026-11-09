@@ -2567,15 +2567,77 @@ begin
 end;
 
 // TODO: Rename
+// True if Dir contains the files of this script (web folder etc.)
+function IsScriptDir(Dir: String): Boolean;
+begin
+  Result := False;
+  if Dir = '' then
+    Exit;
+  if not FileExists(Dir + '\web\ibom.html') then
+    Exit;
+  if not FileExists(Dir + '\altium-pcbdata.js') then
+    Exit;
+  Result := True;
+end;
+
+// Directory of this script, searched in this order:
+// 1. directory of the running script project (any name, also global
+//    script projects; a temporary copy of an OutJob run is skipped
+//    because it does not contain the web folder)
+// 2. the script document in the focused project or in an open project
+//    named InteractiveHTMLBOM4Altium2.PrjScr (previous behaviour)
+// 3. any open project that contains InteractiveHTMLBOM4Altium2.pas
 function GetScriptDir(Dummy: Integer): string;
 var
   Document: IDocument;
+  WS: IWorkSpace;
+  Dir, FallbackDir: String;
+  i: Integer;
 begin
   Result := '';
+  FallbackDir := '';
+
+  try
+    Dir := ExtractFileDir(GetRunningScriptProjectName);
+    if IsScriptDir(Dir) then
+    begin
+      Result := Dir;
+      Exit;
+    end;
+  except
+  end;
 
   Document := FindOriginalProjectDocument(0);
   if Document <> nil then
-    Result := ExtractFileDir(Document.DM_FullPath());
+  begin
+    Dir := ExtractFileDir(Document.DM_FullPath());
+    if IsScriptDir(Dir) then
+    begin
+      Result := Dir;
+      Exit;
+    end;
+    FallbackDir := Dir;
+  end;
+
+  WS := GetWorkSpace;
+  if WS <> nil then
+    for i := 0 to WS.DM_ProjectCount - 1 do
+    begin
+      Document := ProjectGetDocumentByFileName(WS.DM_Projects(i),
+        'InteractiveHTMLBOM4Altium2.pas');
+      if Document <> nil then
+      begin
+        Dir := ExtractFileDir(Document.DM_FullPath());
+        if IsScriptDir(Dir) then
+        begin
+          Result := Dir;
+          Exit;
+        end;
+      end;
+    end;
+
+  // Let the caller report the missing files in the directory found
+  Result := FallbackDir;
 end;
 
 // TODO: Rename
@@ -2625,7 +2687,8 @@ begin
   if ErrorCode = -1 then
     Error := 'Please enter path without trailing slash';
   if ErrorCode = -2 then
-    Error := 'Cant find InteractiveHTMLBOM4Altium2.pas in project please add it or use absolute path';
+    Error := 'Cant find the directory of InteractiveHTMLBOM4Altium2.pas (with the web folder). ' +
+      'Please open InteractiveHTMLBOM4Altium2.PrjScr in the Projects panel or add the script to the project.';
 
   if Error = '' then
   begin
@@ -2651,6 +2714,7 @@ begin
     Files.Add('web\table-util.js');
     Files.Add('web\ibom.js');
     Files.Add('web\user-file-examples\user.js');
+    Files.Add('altium-variants.js');
     Files.Add('altium-user.js');
     Files.Add('web\user-file-examples\userheader.html');
     Files.Add('web\user-file-examples\userfooter.html');
