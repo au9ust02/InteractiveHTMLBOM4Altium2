@@ -50,6 +50,23 @@ Set output format for generated file.
 2. JS - js file for my own needs
 3. JSON Generic - json file complies to the [schema](https://github.com/openscopeproject/InteractiveHtmlBom/tree/master/InteractiveHtmlBom/ecad/schema), that is needed to generate the [InteractiveHtmlBom](https://github.com/openscopeproject/InteractiveHtmlBom). See project wiki for [installation](https://github.com/openscopeproject/InteractiveHtmlBom/wiki/Installation) and [usage](https://github.com/openscopeproject/InteractiveHtmlBom/wiki/Usage) instructions.
 
+### Assembly variants
+The HTML output contains all components of the board together with their state in every
+assembly variant of the project. The variant is selected in the generated page with the
+radio buttons in the header, there is no need to generate one file per variant:
+1. The BOM table, the quantities and the DNP outlines on the board follow the selected variant.
+2. Parameter variations (e.g. a different value) and alternate parts (Design Item ID) are applied.
+3. The variant chosen in Altium (current project variant) is selected initially, the last
+   selection is remembered by the browser.
+4. Checkbox states (e.g. "Sourced", "Placed") are stored per variant.
+5. Components of kind "Standard (No BOM)", "Net Tie (No BOM)" and "Graphical" are drawn
+   but never listed in the BOM.
+
+The Design Item ID is always available as BOM column (it can be hidden in the page settings).
+
+The JSON Generic output still contains only the components fitted in the selected variant,
+with the variant's parameter values applied.
+
 ## Customization
 This plugin extends the original [InteractiveHtmlBom](https://github.com/openscopeproject/InteractiveHtmlBom), focusing specifically on data extraction from Altium Designer. Any customization of the UI/UX of the generated document is outside the scope of this work. That said, I do my best to address questions as they arise, but before posting, please review the relevant documentation [here](https://github.com/openscopeproject/InteractiveHtmlBom/wiki/Customization) and [here](https://github.com/openscopeproject/InteractiveHtmlBom/issues/405).
 

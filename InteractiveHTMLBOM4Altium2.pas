@@ -421,6 +421,7 @@ Var
   ComponentVariation: IComponentVariation;
 
 Begin
+  Result := nil;
   FlattenedDoc := GetFlatDoc(0);
 
   CompCount := FlattenedDoc.DM_ComponentCount;
@@ -510,6 +511,202 @@ begin
       end;
     end;
   end;
+end;
+
+{
+  FieldKey maps Altium parameter names to the field names used in the
+  generated BOM (config.fields, altiumconfig.group_fields and extra_fields).
+}
+function FieldKey(Name: String): String;
+begin
+  Result := Name;
+  if Name = ValueParameterName then
+    Result := 'Value'
+  else if Name = '[Footprint]' then
+    Result := 'Footprint'
+  else if Name = '[DesignItemID]' then
+    Result := 'Design Item ID';
+end;
+
+{
+  Assembly variants are addressed by index:
+  0 = base design ("[No Variations]"), 1..n = project variants.
+}
+function GetVariantCount(Dummy: Integer): Integer;
+begin
+  Result := 1;
+  if CurrProject <> nil then
+    Result := CurrProject.DM_ProjectVariantCount + 1;
+end;
+
+function GetVariantByIndex(Index: Integer): IProjectVariant;
+begin
+  Result := nil;
+  if Index > 0 then
+    Result := CurrProject.DM_ProjectVariants[Index - 1];
+end;
+
+function GetVariantName(Index: Integer): String;
+begin
+  if Index = 0 then
+    Result := '[No Variations]'
+  else
+    Result := GetVariantByIndex(Index).DM_Description;
+end;
+
+{
+  Index of the variant selected for generation (the current project variant),
+  used as the initially active variant in the generated HTML.
+}
+function GetDefaultVariantIndex(Dummy: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  if ProjectVariant = nil then
+    Exit;
+  for i := 1 to GetVariantCount(0) - 1 do
+    if GetVariantName(i) = ProjectVariant.DM_Description then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
+{
+  GetVariantOverrides returns the parameter values a variant changes for a
+  component as Name=Value pairs (Altium parameter names). For alternate parts
+  the Design Item ID of the alternate part is returned as [DesignItemID].
+  The variation API calls are guarded, a failing call only drops the overrides.
+}
+function GetVariantOverrides(_ProjectVariant: IProjectVariant;
+  Designator: String): TStringList;
+var
+  ComponentVariation: IComponentVariation;
+  ParameterVariation: IParameterVariation;
+  i: Integer;
+  Name, Value, AltId: String;
+begin
+  Result := TStringList.Create;
+  if _ProjectVariant = nil then
+    Exit;
+
+  ComponentVariation := _ProjectVariant.DM_FindComponentVariationByDesignator
+    (Designator);
+  if ComponentVariation = nil then
+    Exit;
+  if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
+    Exit;
+
+  try
+    for i := 0 to ComponentVariation.DM_VariedParameterCount - 1 do
+    begin
+      ParameterVariation := ComponentVariation.DM_VariedParameters(i);
+      Name := ParameterVariation.DM_ParameterName;
+      Value := ParameterVariation.DM_VariedValue;
+      if Name <> '' then
+      begin
+        // Add instead of Values[] := Value, which deletes empty values
+        Result.Add(Name + '=' + Value);
+        if Name = 'Comment' then
+          Result.Add('[Comment]=' + Value);
+      end;
+    end;
+  except
+  end;
+
+  if ComponentVariation.DM_VariationKind = eVariation_Alternate then
+  begin
+    try
+      AltId := ComponentVariation.DM_AlternateLibraryLink.DM_DesignItemID;
+      if AltId <> '' then
+        Result.Add('[DesignItemID]=' + AltId);
+    except
+    end;
+  end;
+end;
+
+{
+  ComponentIsNoBOM is True for components that never appear in the BOM
+  (component kind "Standard (No BOM)", "Net Tie (No BOM)" or "Graphical").
+}
+function ComponentIsNoBOM(Component: IPCB_Component;
+  FlattenedDocument: IDocument): Boolean;
+var
+  SchComponent: IComponent;
+  CurrParm: IParameter;
+begin
+  Result := False;
+
+  try
+    if (Component.ComponentKind = eComponentKind_StandardNoBOM) or
+      (Component.ComponentKind = eComponentKind_NetTie_NoBOM) or
+      (Component.ComponentKind = eComponentKind_Graphical) then
+      Result := True;
+  except
+  end;
+  if Result then
+    Exit;
+
+  // Fallback: schematic parameter, as used by previous versions
+  if FlattenedDocument = nil then
+    Exit;
+  if FlattenedDocument.DM_ComponentCount = 0 then
+    Exit;
+  SchComponent := GetCompFromCompEx(Component);
+  if SchComponent = nil then
+    Exit;
+  CurrParm := SchComponent.DM_GetParameterByName('Component Kind');
+  if CurrParm <> nil then
+    if CurrParm.DM_Value = 'Standard (No BOM)' then
+      Result := True;
+end;
+
+{
+  ComponentVariantsJSON returns the per variant state of a component:
+  "variants":[{"fitted":true,"fields":{...}}, ...], indexed like GetVariantName.
+  "fields" holds only the values that the variant changes.
+}
+function ComponentVariantsJSON(Component: IPCB_Component): String;
+var
+  i, j: Integer;
+  _Variant: IProjectVariant;
+  Overrides: TStringList;
+  Fitted: Boolean;
+  Fields, Name: String;
+begin
+  Result := '"variants":[';
+  for i := 0 to GetVariantCount(0) - 1 do
+  begin
+    _Variant := GetVariantByIndex(i);
+    Fitted := ComponentIsFittedInCurrentVariant(Component.SourceUniqueId,
+      Component.SourceDesignator, _Variant);
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + '{"fitted":' + JSONBoolToStr(Fitted);
+
+    if Fitted then
+    begin
+      Overrides := GetVariantOverrides(_Variant, Component.SourceDesignator);
+      if Overrides.Count > 0 then
+      begin
+        Fields := '';
+        for j := 0 to Overrides.Count - 1 do
+        begin
+          Name := Overrides.Names[j];
+          if j > 0 then
+            Fields := Fields + ',';
+          Fields := Fields + JSONStrToStr(FieldKey(Name)) + ':' +
+            JSONStrToStr(Overrides.Values[Name]);
+        end;
+        Result := Result + ',"fields":{' + Fields + '}';
+      end;
+      Overrides.Free;
+    end;
+
+    Result := Result + '}';
+  end;
+  Result := Result + ']';
 end;
 
 function GetComponentParameters(comp: IPCB_Component): TStringList;
@@ -733,8 +930,14 @@ begin
     end;
 end;
 
+{
+  Overrides: parameter values of the selected variant to apply (generic JSON
+  output), may be nil. VariantsJSON: additional component properties for the
+  HTML/JS output (unique id and per variant state), empty for generic JSON.
+}
 function ParseComponentGeneric(Board: IPCB_Board; Component: TObject;
-  SelectedFields, SelectedGroupParameters: TStringList; NoBOM: Boolean): String;
+  SelectedFields, SelectedGroupParameters: TStringList; NoBOM: Boolean;
+  Overrides: TStringList; VariantsJSON: String): String;
 var
   PnPout: TStringList;
   Iterator: IPCB_BoardIterator;
@@ -750,6 +953,7 @@ var
   Width, Height: String;
 
   Parameters: TStringList;
+  Keys: TStringList;
   i, j: Integer;
   Key: String;
 begin
@@ -791,6 +995,14 @@ begin
 
   Parameters := GetComponentParameters(Component);
 
+  // Apply parameter variations of the selected variant
+  if Overrides <> nil then
+    for i := 0 to Overrides.Count - 1 do
+    begin
+      Key := Overrides.Names[i];
+      Parameters.Values[Key] := Overrides.Values[Key];
+    end;
+
   PnPout.Add('{');
   PnPout.Add('"attr":' + JSONStrToStr('') + ',');
   PnPout.Add('"footprint":' + JSONStrToStr(Component.Pattern) + ',');
@@ -800,41 +1012,34 @@ begin
     [ValueParameterName]) + ',');
   PnPout.Add('"extra_fields": {');
 
-  j := 0;
+  // Columns, group fields and the Design Item ID (always exported)
+  Keys := TStringList.Create;
   for i := 0 to SelectedFields.Count - 1 do
-  begin
-    Key := SelectedFields[i];
-    if Key = ValueParameterName then
-      continue;
-    if Key = '[Footprint]' then
-      continue;
-
-    if (j > 0) then
-      PnPout.Add(',');
-    PnPout.Add('"' + Key + '":' + JSONStrToStr(Parameters.Values[Key]));
-    j := j + 1;
-  end;
-
+    if Keys.IndexOf(SelectedFields[i]) = -1 then
+      Keys.Add(SelectedFields[i]);
   for i := 0 to SelectedGroupParameters.Count - 1 do
+    if Keys.IndexOf(SelectedGroupParameters[i]) = -1 then
+      Keys.Add(SelectedGroupParameters[i]);
+  if Keys.IndexOf('[DesignItemID]') = -1 then
+    Keys.Add('[DesignItemID]');
+
+  j := 0;
+  for i := 0 to Keys.Count - 1 do
   begin
-    Key := SelectedGroupParameters[i];
+    Key := Keys[i];
     if Key = ValueParameterName then
       continue;
     if Key = '[Footprint]' then
       continue;
 
-    if SelectedFields.IndexOf(Key) = -1 then
-      continue;
-
-    // TODO: Strange hack
-    if ListIndexOf(SelectedFields, Key) = -1 then
-      continue;
-
     if (j > 0) then
       PnPout.Add(',');
-    PnPout.Add('"' + Key + '":' + JSONStrToStr(Parameters.Values[Key]));
+    PnPout.Add(JSONStrToStr(FieldKey(Key)) + ':' +
+      JSONStrToStr(Parameters.Values[Key]));
     j := j + 1;
   end;
+  Keys.Free;
+  Parameters.Free;
 
   if (j > 0) then
     PnPout.Add(',');
@@ -847,6 +1052,9 @@ begin
   // PnPout.Add('"Value":' + JSONStrToStr(sl.Values[ValueParameterName]) + ',');
 
   PnPout.Add('}');
+
+  if VariantsJSON <> '' then
+    PnPout.Add(',' + VariantsJSON);
 
   PnPout.Add('}');
 
@@ -1529,7 +1737,13 @@ begin
   end;
 end;
 
-function PickAndPlaceOutputGeneric(Dummy: Boolean): String;
+{
+  HtmlMode = True (HTML/JS output): all components are exported together with
+  their state in every assembly variant, the variant is chosen in the browser.
+  HtmlMode = False (generic JSON): only components fitted in the selected
+  variant are exported, with the variant's parameter values applied.
+}
+function PickAndPlaceOutputGeneric(HtmlMode: Boolean): String;
 var
   Board: IPCB_Board; // document board object
   Component: IPCB_Component; // component object
@@ -1577,6 +1791,10 @@ var
   SilkscreenB: String;
   FontData: String;
   i: Integer;
+  IncludeComponent: Boolean;
+  Overrides: TStringList;
+  VariantsJSON: String;
+  VariantList: String;
 Begin
   // Make sure the current Workspace opens or else quit this script
   CurrWorkSpace := GetWorkSpace;
@@ -1631,44 +1849,48 @@ Begin
 
   While (Component <> Nil) Do
   Begin
-    NoBOM := False;
+    NoBOM := ComponentIsNoBOM(Component, FlattenedDocument);
 
-    // TODO: False if no project or schematic is loaded, or if compilation failed. Consider asking the user whether to continue
-    if (FlattenedDocument <> nil) and (FlattenedDocument.DM_ComponentCount > 0)
-    then
-    begin
-      // TODO: ccc = nil is possible?
-      ccc := GetCompFromCompEx(Component);
+    if HtmlMode then
+      IncludeComponent := True
+    else
+      IncludeComponent := ComponentIsFittedInCurrentVariant
+        (Component.SourceUniqueId, Component.SourceDesignator, ProjectVariant);
 
-      // TODO: HOW?
-      CurrParm := ccc.DM_GetParameterByName('Component Kind');
-      // (CurrParm <> nil) and
-      if (CurrParm.DM_Value = 'Standard (No BOM)') then
-      begin
-        NoBOM := True;
-      end;
-    end;
-
-    // Print Pick&Place data of SMD components to file
-    if ComponentIsFittedInCurrentVariant(Component.SourceUniqueId,
-      Component.SourceDesignator, ProjectVariant) then
+    if IncludeComponent then
       if (LayerFilterIndex = 0) or
-        ((LayerFilterCb = 1) and (Component.Layer = eTopLayer)) or
-        ((LayerFilterCb = 2) and (Component.Layer = eBottomLayer)) then
+        ((LayerFilterIndex = 1) and (Component.Layer = eTopLayer)) or
+        ((LayerFilterIndex = 2) and (Component.Layer = eBottomLayer)) then
       Begin
         Inc(Count);
         If (Count > 1) Then
         begin
-          Components := Components + ','; // PnPout.Add(',');
-          Footprints := Footprints + ','; // PnPout.Add(',');
+          Components := Components + ',';
+          Footprints := Footprints + ',';
+        end;
+
+        if HtmlMode then
+        begin
+          Overrides := nil;
+          VariantsJSON := '"unique_id":' +
+            JSONStrToStr(Component.SourceUniqueId) + ',' +
+            ComponentVariantsJSON(Component);
+        end
+        else
+        begin
+          Overrides := GetVariantOverrides(ProjectVariant,
+            Component.SourceDesignator);
+          VariantsJSON := '';
         end;
 
         Components := Components + ParseComponentGeneric(Board, Component,
-          SelectedFields, SelectedGroupParameters, NoBOM);
+          SelectedFields, SelectedGroupParameters, NoBOM, Overrides,
+          VariantsJSON);
         Footprints := Footprints + ParseFootprintGeneric(Board,
           Component, NoBOM);
 
-        // PnPout.Add(ParseComponent(Board, Component, SelectedFields, SelectedGroupParameters, NoBOM));
+        if Overrides <> nil then
+          Overrides.Free;
       end;
     Component := Iterator.NextPCBObject;
   end;
@@ -1937,7 +2159,7 @@ Begin
   Metadata := Metadata + '"title":' + JSONStrToStr(Title) + ',';
   Metadata := Metadata + '"revision":' + JSONStrToStr(Revision) + ',';
   Metadata := Metadata + '"company":' + JSONStrToStr(Company) + ',';
-  Metadata := Metadata + '"date":' + JSONStrToStr('todo');
+  Metadata := Metadata + '"date":' + JSONStrToStr(FormatDateTime('yyyy-mm-dd hh:nn', Now));
 
   (* PnPout.Add('},');
     PnPout.Add('"Settings":{');
@@ -1990,6 +2212,18 @@ Begin
   PnPout.Add('],');
   PnPout.Add('"font_data": ' + FontData + '');
   PnPout.Add('},');
+  if HtmlMode then
+  begin
+    VariantList := '';
+    for i := 0 to GetVariantCount(0) - 1 do
+    begin
+      if i > 0 then
+        VariantList := VariantList + ',';
+      VariantList := VariantList + JSONStrToStr(GetVariantName(i));
+    end;
+    PnPout.Add('"variants": [' + VariantList + '],');
+    PnPout.Add('"default_variant": ' + IntToStr(GetDefaultVariantIndex(0)) + ',');
+  end;
   PnPout.Add('"components": [' + Components + ']');
   PnPout.Add('}');
 
@@ -2087,6 +2321,7 @@ begin
   Data := ReplaceEx(Data, 'IBOMJS', GetWDFileName('web\ibom.js'));
   Data := ReplaceEx2(Data, 'USERJS',
     StringLoadFromFile(GetWDFileName('web\user-file-examples\user.js')) + #13#10
+    + StringLoadFromFile(GetWDFileName('altium-variants.js')) + #13#10
     + StringLoadFromFile(GetWDFileName('altium-user.js')));
   Data := ReplaceEx(Data, 'USERHEADER',
     GetWDFileName('web\user-file-examples\userheader.html'));
@@ -2120,7 +2355,11 @@ Begin
   PnPout.Add('var config = {');
   PnPout.Add('"show_fabrication":' + JSONBoolToStr(FabLayer) + ',');
   PnPout.Add('"redraw_on_drag":' + JSONBoolToStr(True) + ',');
-  PnPout.Add('"highlight_pin1":' + JSONBoolToStr(Highlighting1Pin) + ',');
+  if Highlighting1Pin then
+    PnPout.Add('"highlight_pin1":' + JSONStrToStr('all') + ',')
+  else
+    PnPout.Add('"highlight_pin1":' + JSONStrToStr('none') + ',');
+  PnPout.Add('"mark_when_checked":' + JSONStrToStr('') + ',');
   PnPout.Add('"offset_back_rotation":' + JSONBoolToStr(False) + ',');
   PnPout.Add('"kicad_text_formatting":' + JSONBoolToStr(True) + ',');
   PnPout.Add('"dark_mode":' + JSONBoolToStr(DarkMode) + ',');
@@ -2132,6 +2371,9 @@ Begin
 
   Count := 0;
   SelectedFields := GetSelectedFields(0);
+  // The Design Item ID is always shown (the column can be hidden in the HTML)
+  if SelectedFields.IndexOf('[DesignItemID]') = -1 then
+    SelectedFields.Add('[DesignItemID]');
   for i := 0 to SelectedFields.Count - 1 do
   begin
     if Count > 0 then
@@ -2139,11 +2381,7 @@ Begin
 
     // NOTE: Rename component build-in fields (Value, Footprint...)
     // TODO: Reference, Attribute, Layer
-    Value := SelectedFields[i];
-    if SelectedFields[i] = ValueParameterName then
-      Value := 'Value';
-    if SelectedFields[i] = '[Footprint]' then
-      Value := 'Footprint';
+    Value := FieldKey(SelectedFields[i]);
 
     PnPout.Add(JSONStrToStr(Value));
 
@@ -2181,11 +2419,7 @@ Begin
 
     // NOTE: Rename component build-in fields (Value, Footprint...)
     // TODO: Reference, Attribute, Layer
-    Value := SelectedGroupParameters[i];
-    if SelectedGroupParameters[i] = ValueParameterName then
-      Value := 'Value';
-    if SelectedGroupParameters[i] = '[Footprint]' then
-      Value := 'Footprint';
+    Value := FieldKey(SelectedGroupParameters[i]);
 
     PnPout.Add(JSONStrToStr(Value));
 
