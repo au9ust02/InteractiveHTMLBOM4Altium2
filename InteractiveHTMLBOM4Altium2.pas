@@ -615,14 +615,14 @@ begin
   except
   end;
 
-  if ComponentVariation.DM_VariationKind = eVariation_Alternate then
-  begin
-    try
-      AltId := ComponentVariation.DM_AlternateLibraryLink.DM_DesignItemID;
-      if AltId <> '' then
-        Result.Add('[DesignItemID]=' + AltId);
-    except
-    end;
+  // Alternate part: Design Item ID of the alternate component. Not limited
+  // to the alternate variation kind, its constant name is not available in
+  // all Altium versions.
+  try
+    AltId := ComponentVariation.DM_AlternateLibraryLink.DM_DesignItemID;
+    if AltId <> '' then
+      Result.Add('[DesignItemID]=' + AltId);
+  except
   end;
 end;
 
@@ -635,13 +635,17 @@ function ComponentIsNoBOM(Component: IPCB_Component;
 var
   SchComponent: IComponent;
   CurrParm: IParameter;
+  Kind: Integer;
 begin
   Result := False;
 
+  // TComponentKind values are compared as numbers, the constant names
+  // differ between Altium versions (undeclared identifiers abort the script):
+  // 0 Standard, 1 Mechanical, 2 Graphical, 3 Net Tie (BOM),
+  // 4 Net Tie (No BOM), 5 Standard (No BOM), 6 Jumper
   try
-    if (Component.ComponentKind = eComponentKind_StandardNoBOM) or
-      (Component.ComponentKind = eComponentKind_NetTie_NoBOM) or
-      (Component.ComponentKind = eComponentKind_Graphical) then
+    Kind := Component.ComponentKind;
+    if (Kind = 2) or (Kind = 4) or (Kind = 5) then
       Result := True;
   except
   end;
