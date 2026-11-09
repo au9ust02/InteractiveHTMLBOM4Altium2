@@ -662,11 +662,10 @@ begin
       Result := True;
 end;
 
-{
-  ComponentVariantsJSON returns the per variant state of a component:
-  "variants":[{"fitted":true,"fields":{...}}, ...], indexed like GetVariantName.
-  "fields" holds only the values that the variant changes.
-}
+// ComponentVariantsJSON returns the per variant state of a component:
+// "variants":[{"fitted":true,"fields":{...}}, ...], indexed like GetVariantName.
+// "fields" holds only the values that the variant changes.
+// (Line comments: a closing curly brace would end a brace comment.)
 function ComponentVariantsJSON(Component: IPCB_Component): String;
 var
   i, j: Integer;
