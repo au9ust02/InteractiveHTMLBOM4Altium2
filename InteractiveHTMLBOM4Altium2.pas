@@ -9,6 +9,12 @@ const
 
   // Write <project>-variants.log next to the output (variant diagnostics)
   WriteVariantLog = True;
+  // Read parameter variations (e.g. a different value) of the variants
+  ReadParameterVariations = True;
+  // Read the Design Item ID of alternate parts (API not verified yet)
+  ReadAlternatePartId = False;
+  // Draw the board shape as board edge (False: lines on the keep-out layer)
+  UseBoardShape = True;
 
 var
   CurrWorkSpace: IWorkSpace; // An Interface handle to the current workspace
@@ -41,6 +47,7 @@ var
   BaseFullDir: String;
   PcbUniqueIds: TStringList; // SourceUniqueId of all PCB components
   VariantLog: TStringList; // Diagnostic log of the variant evaluation
+  VariantLogFile: String;
 
 procedure SetupProjectVariant(Dummy: Integer); forward;
 function GetBoard(Dummy: Integer): IPCB_Board; forward;
@@ -584,6 +591,17 @@ end;
   the Design Item ID of the alternate part is returned as [DesignItemID].
   The variation API calls are guarded, a failing call only drops the overrides.
 }
+// Adds a line to the variant log. Flush saves the log right away, so that it
+// shows how far the script got if Altium aborts it.
+procedure LogLine(Line: String; Flush: Boolean);
+begin
+  if VariantLog = nil then
+    Exit;
+  VariantLog.Add(Line);
+  if Flush then
+    VariantLog.SaveToFile(VariantLogFile);
+end;
+
 // Designator as placed on the board (physical designator, e.g. in
 // multi-channel designs), falls back to the schematic designator.
 function PhysicalDesignator(Component: IPCB_Component): String;
@@ -698,8 +716,6 @@ begin
     if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
       Result := Result + ' (not fitted)';
     Result := Result + ', variation id=' + ComponentVariation.DM_UniqueId;
-    Result := Result + ', varied parameters=' +
-      IntToStr(ComponentVariation.DM_VariedParameterCount);
   except
     Result := Result + ', (error reading variation)';
   end;
@@ -723,31 +739,41 @@ begin
   if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
     Exit;
 
-  try
-    for i := 0 to ComponentVariation.DM_VariedParameterCount - 1 do
+  // Calls of methods that do not exist end in an access violation which
+  // try/except does not catch, therefore the switches.
+  if ReadParameterVariations then
+  begin
+    LogLine('    reading parameter variations of ' +
+      PhysicalDesignator(Component) + ' in ' +
+      _ProjectVariant.DM_Description, True);
+    for i := 0 to ComponentVariation.DM_VariationCount - 1 do
     begin
-      ParameterVariation := ComponentVariation.DM_VariedParameters(i);
-      Name := ParameterVariation.DM_ParameterName;
-      Value := ParameterVariation.DM_VariedValue;
-      if Name <> '' then
+      ParameterVariation := ComponentVariation.DM_Variations(i);
+      if ParameterVariation <> nil then
       begin
-        // Add instead of Values[] := Value, which deletes empty values
-        Result.Add(Name + '=' + Value);
-        if Name = 'Comment' then
-          Result.Add('[Comment]=' + Value);
+        Name := ParameterVariation.DM_ParameterName;
+        Value := ParameterVariation.DM_VariedValue;
+        if Name <> '' then
+        begin
+          // Add instead of Values[] := Value, which deletes empty values
+          Result.Add(Name + '=' + Value);
+          if Name = 'Comment' then
+            Result.Add('[Comment]=' + Value);
+        end;
       end;
     end;
-  except
   end;
 
-  // Alternate part: Design Item ID of the alternate component. Not limited
-  // to the alternate variation kind, its constant name is not available in
-  // all Altium versions.
-  try
-    AltId := ComponentVariation.DM_AlternateLibraryLink.DM_DesignItemID;
-    if AltId <> '' then
-      Result.Add('[DesignItemID]=' + AltId);
-  except
+  // Alternate part: Design Item ID of the alternate component
+  if ReadAlternatePartId then
+  begin
+    LogLine('    reading alternate part of ' + PhysicalDesignator(Component), True);
+    if ComponentVariation.DM_AlternateLibraryLink <> nil then
+    begin
+      AltId := ComponentVariation.DM_AlternateLibraryLink.DM_DesignItemID;
+      if AltId <> '' then
+        Result.Add('[DesignItemID]=' + AltId);
+    end;
   end;
 end;
 
@@ -803,18 +829,16 @@ var
   Fitted: Boolean;
   Fields, Name: String;
 begin
-  if VariantLog <> nil then
-    VariantLog.Add(PhysicalDesignator(Component) + ' (schematic ' +
-      Component.SourceDesignator + ', unique id ' + Component.SourceUniqueId +
-      ')');
+  LogLine(PhysicalDesignator(Component) + ' (schematic ' +
+    Component.SourceDesignator + ', unique id ' + Component.SourceUniqueId +
+    ')', True);
 
   Result := '"variants":[';
   for i := 0 to GetVariantCount(0) - 1 do
   begin
     _Variant := GetVariantByIndex(i);
     Fitted := ComponentFittedInVariant(Component, _Variant);
-    if VariantLog <> nil then
-      VariantLog.Add(VariantLogLine(Component, _Variant, Fitted));
+    LogLine(VariantLogLine(Component, _Variant, Fitted), False);
     if i > 0 then
       Result := Result + ',';
     Result := Result + '{"fitted":' + JSONBoolToStr(Fitted);
@@ -822,6 +846,8 @@ begin
     if Fitted then
     begin
       Overrides := GetVariantOverrides(_Variant, Component);
+      if Overrides.Count > 0 then
+        LogLine('    changed values: ' + Overrides.CommaText, False);
       if Overrides.Count > 0 then
       begin
         Fields := '';
@@ -1878,53 +1904,54 @@ end;
 }
 function ParseBoardOutlineGeneric(Board: IPCB_Board): String;
 var
-  EdgeWidth: String;
   Outline: IPCB_BoardOutline;
-  Seg, NextSeg: TPolySegment;
-  i, n: Integer;
-  Edge: String;
+  i, j, n: Integer;
+  Edge, EdgeWidth: String;
 begin
   Result := '';
   EdgeWidth := '0.1';
-  try
-    Outline := Board.BoardOutline;
-    if Outline = nil then
-      Exit;
-    n := Outline.PointCount;
-    if n < 2 then
-      Exit;
 
-    for i := 0 to n - 1 do
+  Outline := Board.BoardOutline;
+  if Outline = nil then
+    Exit;
+  n := Outline.PointCount;
+  LogLine('Board shape: ' + IntToStr(n) + ' segments', True);
+  if n < 2 then
+    Exit;
+
+  for i := 0 to n - 1 do
+  begin
+    // Segments[] returns a record: always access its fields directly
+    if Outline.Segments[i].Kind = 1 then
     begin
-      Seg := Outline.Segments[i];
-      if Seg.Kind = 1 then
-      begin
-        Edge := '{"type":"arc","start":[' +
-          JSONFloatToStr(CoordToMMs(Seg.cx - Board.XOrigin)) + ',' +
-          JSONFloatToStr(-CoordToMMs(Seg.cy - Board.YOrigin)) + '],' +
-          '"radius":' + JSONFloatToStr(CoordToMMs(Seg.Radius)) + ',' +
-          '"startangle":' + JSONFloatToStr(-Seg.Angle2) + ',' +
-          '"endangle":' + JSONFloatToStr(-Seg.Angle1) + ',' +
-          '"width":' + EdgeWidth + '}';
-      end
-      else
-      begin
-        NextSeg := Outline.Segments[(i + 1) mod n];
-        Edge := '{"type":"segment","start":[' +
-          JSONFloatToStr(CoordToMMs(Seg.vx - Board.XOrigin)) + ',' +
-          JSONFloatToStr(-CoordToMMs(Seg.vy - Board.YOrigin)) + '],' +
-          '"end":[' +
-          JSONFloatToStr(CoordToMMs(NextSeg.vx - Board.XOrigin)) + ',' +
-          JSONFloatToStr(-CoordToMMs(NextSeg.vy - Board.YOrigin)) + '],' +
-          '"width":' + EdgeWidth + '}';
-      end;
-      if Result <> '' then
-        Result := Result + ', ';
-      Result := Result + Edge;
+      Edge := '{"type":"arc","start":[' +
+        JSONFloatToStr(CoordToMMs(Outline.Segments[i].cx - Board.XOrigin)) +
+        ',' +
+        JSONFloatToStr(-CoordToMMs(Outline.Segments[i].cy - Board.YOrigin)) +
+        '],' + '"radius":' +
+        JSONFloatToStr(CoordToMMs(Outline.Segments[i].Radius)) + ',' +
+        '"startangle":' + JSONFloatToStr(-Outline.Segments[i].Angle2) + ',' +
+        '"endangle":' + JSONFloatToStr(-Outline.Segments[i].Angle1) + ',' +
+        '"width":' + EdgeWidth + '}';
+    end
+    else
+    begin
+      j := (i + 1) mod n;
+      Edge := '{"type":"segment","start":[' +
+        JSONFloatToStr(CoordToMMs(Outline.Segments[i].vx - Board.XOrigin)) +
+        ',' +
+        JSONFloatToStr(-CoordToMMs(Outline.Segments[i].vy - Board.YOrigin)) +
+        '],' + '"end":[' +
+        JSONFloatToStr(CoordToMMs(Outline.Segments[j].vx - Board.XOrigin)) +
+        ',' +
+        JSONFloatToStr(-CoordToMMs(Outline.Segments[j].vy - Board.YOrigin)) +
+        '],' + '"width":' + EdgeWidth + '}';
     end;
-  except
-    Result := '';
+    if Result <> '' then
+      Result := Result + ', ';
+    Result := Result + Edge;
   end;
+  LogLine('Board shape: done', True);
 end;
 
 {
@@ -2042,6 +2069,9 @@ Begin
   if HtmlMode and WriteVariantLog then
   begin
     VariantLog := TStringList.Create;
+    VariantLogFile := GetOutputFileNameWithExtension('-variants.log');
+    if not DirectoryExists(ExtractFileDir(VariantLogFile)) then
+      ForceDirectories(ExtractFileDir(VariantLogFile));
     VariantLog.Add('InteractiveHTMLBOM4Altium2 variant log, ' +
       FormatDateTime('yyyy-mm-dd hh:nn', Now));
     VariantLog.Add('Variants:');
@@ -2049,7 +2079,11 @@ Begin
       VariantLog.Add('  ' + IntToStr(i) + ': ' + GetVariantName(i));
     VariantLog.Add('Initially selected: ' +
       GetVariantName(GetDefaultVariantIndex(0)));
-    VariantLog.Add('');
+    VariantLog.Add('Switches: ReadParameterVariations=' +
+      JSONBoolToStr(ReadParameterVariations) + ', ReadAlternatePartId=' +
+      JSONBoolToStr(ReadAlternatePartId) + ', UseBoardShape=' +
+      JSONBoolToStr(UseBoardShape));
+    LogLine('', True);
   end;
 
   Separator := GetSeparator(0);
@@ -2108,22 +2142,17 @@ Begin
 
   PcbUniqueIds.Free;
   PcbUniqueIds := nil;
-  if VariantLog <> nil then
-  begin
-    try
-      VariantLog.SaveToFile(GetOutputFileNameWithExtension('-variants.log'));
-    except
-    end;
-    VariantLog.Free;
-    VariantLog := nil;
-  end;
+  LogLine('', False);
+  LogLine('Components: done', True);
 
   // PnPout.Add('],');
   // PnPout.Add('"Board":[');
 
   // Board edges: board shape (defined by the Board-Outline layer in current
   // Altium versions), lines on the keep-out layer as fallback
-  Edges := ParseBoardOutlineGeneric(Board);
+  Edges := '';
+  if UseBoardShape then
+    Edges := ParseBoardOutlineGeneric(Board);
 
   if Edges = '' then
   begin
@@ -2154,6 +2183,13 @@ Begin
       Prim := Iter.NextPCBObject;
     end;
     Board.BoardIterator_Destroy(Iter);
+  end;
+
+  if VariantLog <> nil then
+  begin
+    LogLine('Board edges: done', True);
+    VariantLog.Free;
+    VariantLog := nil;
   end;
   (*
     PnPout.Add('],');

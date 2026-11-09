@@ -68,7 +68,13 @@ BOM line, even with the same value and footprint.
 
 For diagnostics a file `<project>-variants.log` is written next to the output. It lists for
 every component and variant whether it is fitted and what Altium reports about its variation.
-It can be switched off with `WriteVariantLog = False` at the top of the script.
+The log is saved while the script runs, so after an abort its last lines show where it stopped.
+
+Switches at the top of the script:
+- `WriteVariantLog`: write the variant log.
+- `ReadParameterVariations`: apply parameter variations (e.g. a different value) of the variants.
+- `ReadAlternatePartId`: take the Design Item ID of alternate parts (not verified yet, off by default).
+- `UseBoardShape`: draw the board shape as board edge instead of the lines on the keep-out layer.
 
 ### Board outline
 The board edges are taken from the board shape (defined by the Board-Outline layer in current
