@@ -62,7 +62,17 @@ radio buttons in the header, there is no need to generate one file per variant:
 5. Components of kind "Standard (No BOM)", "Net Tie (No BOM)" and "Graphical" are drawn
    but never listed in the BOM.
 
-The Design Item ID is always available as BOM column (it can be hidden in the page settings).
+The Design Item ID is always available as BOM column (it can be hidden in the page settings)
+and is always part of the grouping: components with different Design Item IDs never share a
+BOM line, even with the same value and footprint.
+
+For diagnostics a file `<project>-variants.log` is written next to the output. It lists for
+every component and variant whether it is fitted and what Altium reports about its variation.
+It can be switched off with `WriteVariantLog = False` at the top of the script.
+
+### Board outline
+The board edges are taken from the board shape (defined by the Board-Outline layer in current
+Altium versions). Lines on the keep-out layer are only used if no board shape is available.
 
 The JSON Generic output still contains only the components fitted in the selected variant,
 with the variant's parameter values applied.

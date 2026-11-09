@@ -7,6 +7,9 @@ const
 
   SCannotCreateDir = 'Unable to create the folder ''%s''';
 
+  // Write <project>-variants.log next to the output (variant diagnostics)
+  WriteVariantLog = True;
+
 var
   CurrWorkSpace: IWorkSpace; // An Interface handle to the current workspace
   CurrProject: IProject; // An Interface handle to the current Project
@@ -36,6 +39,8 @@ var
   Nets: TStringList;
   EntryPoint: String;
   BaseFullDir: String;
+  PcbUniqueIds: TStringList; // SourceUniqueId of all PCB components
+  VariantLog: TStringList; // Diagnostic log of the variant evaluation
 
 procedure SetupProjectVariant(Dummy: Integer); forward;
 function GetBoard(Dummy: Integer): IPCB_Board; forward;
@@ -579,8 +584,129 @@ end;
   the Design Item ID of the alternate part is returned as [DesignItemID].
   The variation API calls are guarded, a failing call only drops the overrides.
 }
+// Designator as placed on the board (physical designator, e.g. in
+// multi-channel designs), falls back to the schematic designator.
+function PhysicalDesignator(Component: IPCB_Component): String;
+begin
+  Result := '';
+  try
+    Result := Component.Name.Text;
+  except
+  end;
+  if Result = '' then
+    Result := Component.SourceDesignator;
+end;
+
+// Variation of a component in a variant, looked up by the physical and then
+// by the schematic designator. nil if the variant does not change it.
+function FindComponentVariation(_ProjectVariant: IProjectVariant;
+  Component: IPCB_Component): IComponentVariation;
+begin
+  Result := nil;
+  if _ProjectVariant = nil then
+    Exit;
+  Result := _ProjectVariant.DM_FindComponentVariationByDesignator
+    (PhysicalDesignator(Component));
+  if Result = nil then
+    if Component.SourceDesignator <> PhysicalDesignator(Component) then
+      Result := _ProjectVariant.DM_FindComponentVariationByDesignator
+        (Component.SourceDesignator);
+end;
+
+// True if Str ends with Suffix
+function EndsWith(Str, Suffix: String): Boolean;
+begin
+  Result := False;
+  if Length(Suffix) > Length(Str) then
+    Exit;
+  Result := Copy(Str, Length(Str) - Length(Suffix) + 1, Length(Suffix))
+    = Suffix;
+end;
+
+{
+  ComponentFittedInVariant decides whether a PCB component is placed in a
+  variant (nil = base design without variations):
+  - components with "@<variant>" in their unique id exist only for that
+    variant (alternate part with its own footprint),
+  - a component set to "Not Fitted" in the variant is not placed,
+  - a component replaced by such a variant specific component is not placed,
+  - every other component is placed, also if the variant only changes
+    parameters.
+}
+function ComponentFittedInVariant(Component: IPCB_Component;
+  _ProjectVariant: IProjectVariant): Boolean;
+var
+  ComponentVariation: IComponentVariation;
+  Id, Suffix: String;
+begin
+  Id := Component.SourceUniqueId;
+
+  if _ProjectVariant = nil then
+  begin
+    Result := pos('@', Id) = 0;
+    Exit;
+  end;
+
+  Suffix := '@' + _ProjectVariant.DM_Description;
+  if pos('@', Id) <> 0 then
+  begin
+    Result := EndsWith(Id, Suffix);
+    Exit;
+  end;
+
+  Result := True;
+  ComponentVariation := FindComponentVariation(_ProjectVariant, Component);
+  if ComponentVariation = nil then
+    Exit;
+
+  if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  if PcbUniqueIds <> nil then
+    if PcbUniqueIds.IndexOf(ComponentVariation.DM_UniqueId + Suffix) <> -1 then
+      Result := False;
+end;
+
+// One line of the variant log for a component in a variant
+function VariantLogLine(Component: IPCB_Component;
+  _ProjectVariant: IProjectVariant; Fitted: Boolean): String;
+var
+  ComponentVariation: IComponentVariation;
+  Kind: Integer;
+begin
+  Result := '  ';
+  if _ProjectVariant = nil then
+    Result := Result + '[No Variations]'
+  else
+    Result := Result + _ProjectVariant.DM_Description;
+  Result := Result + ': fitted=' + JSONBoolToStr(Fitted);
+  if _ProjectVariant = nil then
+    Exit;
+
+  ComponentVariation := FindComponentVariation(_ProjectVariant, Component);
+  if ComponentVariation = nil then
+  begin
+    Result := Result + ', no variation';
+    Exit;
+  end;
+  try
+    Kind := ComponentVariation.DM_VariationKind;
+    Result := Result + ', kind=' + IntToStr(Kind);
+    if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
+      Result := Result + ' (not fitted)';
+    Result := Result + ', variation id=' + ComponentVariation.DM_UniqueId;
+    Result := Result + ', varied parameters=' +
+      IntToStr(ComponentVariation.DM_VariedParameterCount);
+  except
+    Result := Result + ', (error reading variation)';
+  end;
+end;
+
 function GetVariantOverrides(_ProjectVariant: IProjectVariant;
-  Designator: String): TStringList;
+  Component: IPCB_Component): TStringList;
 var
   ComponentVariation: IComponentVariation;
   ParameterVariation: IParameterVariation;
@@ -591,8 +717,7 @@ begin
   if _ProjectVariant = nil then
     Exit;
 
-  ComponentVariation := _ProjectVariant.DM_FindComponentVariationByDesignator
-    (Designator);
+  ComponentVariation := FindComponentVariation(_ProjectVariant, Component);
   if ComponentVariation = nil then
     Exit;
   if ComponentVariation.DM_VariationKind = eVariation_NotFitted then
@@ -678,19 +803,25 @@ var
   Fitted: Boolean;
   Fields, Name: String;
 begin
+  if VariantLog <> nil then
+    VariantLog.Add(PhysicalDesignator(Component) + ' (schematic ' +
+      Component.SourceDesignator + ', unique id ' + Component.SourceUniqueId +
+      ')');
+
   Result := '"variants":[';
   for i := 0 to GetVariantCount(0) - 1 do
   begin
     _Variant := GetVariantByIndex(i);
-    Fitted := ComponentIsFittedInCurrentVariant(Component.SourceUniqueId,
-      Component.SourceDesignator, _Variant);
+    Fitted := ComponentFittedInVariant(Component, _Variant);
+    if VariantLog <> nil then
+      VariantLog.Add(VariantLogLine(Component, _Variant, Fitted));
     if i > 0 then
       Result := Result + ',';
     Result := Result + '{"fitted":' + JSONBoolToStr(Fitted);
 
     if Fitted then
     begin
-      Overrides := GetVariantOverrides(_Variant, Component.SourceDesignator);
+      Overrides := GetVariantOverrides(_Variant, Component);
       if Overrides.Count > 0 then
       begin
         Fields := '';
@@ -1010,7 +1141,7 @@ begin
   PnPout.Add('"attr":' + JSONStrToStr('') + ',');
   PnPout.Add('"footprint":' + JSONStrToStr(Component.Pattern) + ',');
   PnPout.Add('"layer":' + JSONStrToStr(Layer) + ',');
-  PnPout.Add('"ref":' + JSONStrToStr(Component.SourceDesignator) + ',');
+  PnPout.Add('"ref":' + JSONStrToStr(PhysicalDesignator(Component)) + ',');
   PnPout.Add('"val":' + JSONStrToStr(Parameters.Values
     [ValueParameterName]) + ',');
   PnPout.Add('"extra_fields": {');
@@ -1341,7 +1472,7 @@ begin
 
   PnPout.Add('{');
 
-  PnPout.Add('"ref":' + JSONStrToStr(Component.SourceDesignator) + ',');
+  PnPout.Add('"ref":' + JSONStrToStr(PhysicalDesignator(Component)) + ',');
   PnPout.Add('"center":' + '[0, 0]' + ',');
   PnPout.Add('"bbox": {');
   PnPout.Add('"pos":' + '[' + x + ', ' + Y + ']' + ',');
@@ -1741,6 +1872,62 @@ begin
 end;
 
 {
+  ParseBoardOutlineGeneric returns the board shape as iBOM edges (segments
+  and arcs), empty if the board shape is not available.
+  Segment kind: 0 = line, 1 = arc.
+}
+function ParseBoardOutlineGeneric(Board: IPCB_Board): String;
+var
+  EdgeWidth: String;
+  Outline: IPCB_BoardOutline;
+  Seg, NextSeg: TPolySegment;
+  i, n: Integer;
+  Edge: String;
+begin
+  Result := '';
+  EdgeWidth := '0.1';
+  try
+    Outline := Board.BoardOutline;
+    if Outline = nil then
+      Exit;
+    n := Outline.PointCount;
+    if n < 2 then
+      Exit;
+
+    for i := 0 to n - 1 do
+    begin
+      Seg := Outline.Segments[i];
+      if Seg.Kind = 1 then
+      begin
+        Edge := '{"type":"arc","start":[' +
+          JSONFloatToStr(CoordToMMs(Seg.cx - Board.XOrigin)) + ',' +
+          JSONFloatToStr(-CoordToMMs(Seg.cy - Board.YOrigin)) + '],' +
+          '"radius":' + JSONFloatToStr(CoordToMMs(Seg.Radius)) + ',' +
+          '"startangle":' + JSONFloatToStr(-Seg.Angle2) + ',' +
+          '"endangle":' + JSONFloatToStr(-Seg.Angle1) + ',' +
+          '"width":' + EdgeWidth + '}';
+      end
+      else
+      begin
+        NextSeg := Outline.Segments[(i + 1) mod n];
+        Edge := '{"type":"segment","start":[' +
+          JSONFloatToStr(CoordToMMs(Seg.vx - Board.XOrigin)) + ',' +
+          JSONFloatToStr(-CoordToMMs(Seg.vy - Board.YOrigin)) + '],' +
+          '"end":[' +
+          JSONFloatToStr(CoordToMMs(NextSeg.vx - Board.XOrigin)) + ',' +
+          JSONFloatToStr(-CoordToMMs(NextSeg.vy - Board.YOrigin)) + '],' +
+          '"width":' + EdgeWidth + '}';
+      end;
+      if Result <> '' then
+        Result := Result + ', ';
+      Result := Result + Edge;
+    end;
+  except
+    Result := '';
+  end;
+end;
+
+{
   HtmlMode = True (HTML/JS output): all components are exported together with
   their state in every assembly variant, the variant is chosen in the browser.
   HtmlMode = False (generic JSON): only components fitted in the selected
@@ -1843,6 +2030,28 @@ Begin
   Iterator.AddFilter_IPCB_LayerSet(LayerSet.AllLayers);
   Iterator.AddFilter_Method(eProcessAll);
 
+  PcbUniqueIds := TStringList.Create;
+  Component := Iterator.FirstPCBObject;
+  While (Component <> Nil) Do
+  Begin
+    PcbUniqueIds.Add(Component.SourceUniqueId);
+    Component := Iterator.NextPCBObject;
+  end;
+
+  VariantLog := nil;
+  if HtmlMode and WriteVariantLog then
+  begin
+    VariantLog := TStringList.Create;
+    VariantLog.Add('InteractiveHTMLBOM4Altium2 variant log, ' +
+      FormatDateTime('yyyy-mm-dd hh:nn', Now));
+    VariantLog.Add('Variants:');
+    for i := 0 to GetVariantCount(0) - 1 do
+      VariantLog.Add('  ' + IntToStr(i) + ': ' + GetVariantName(i));
+    VariantLog.Add('Initially selected: ' +
+      GetVariantName(GetDefaultVariantIndex(0)));
+    VariantLog.Add('');
+  end;
+
   Separator := GetSeparator(0);
   Count := 0;
   PnPout := TStringList.Create;
@@ -1857,8 +2066,7 @@ Begin
     if HtmlMode then
       IncludeComponent := True
     else
-      IncludeComponent := ComponentIsFittedInCurrentVariant
-        (Component.SourceUniqueId, Component.SourceDesignator, ProjectVariant);
+      IncludeComponent := ComponentFittedInVariant(Component, ProjectVariant);
 
     if IncludeComponent then
       if (LayerFilterIndex = 0) or
@@ -1881,8 +2089,7 @@ Begin
         end
         else
         begin
-          Overrides := GetVariantOverrides(ProjectVariant,
-            Component.SourceDesignator);
+          Overrides := GetVariantOverrides(ProjectVariant, Component);
           VariantsJSON := '';
         end;
 
@@ -1899,38 +2106,55 @@ Begin
   end;
   Board.BoardIterator_Destroy(Iterator);
 
+  PcbUniqueIds.Free;
+  PcbUniqueIds := nil;
+  if VariantLog <> nil then
+  begin
+    try
+      VariantLog.SaveToFile(GetOutputFileNameWithExtension('-variants.log'));
+    except
+    end;
+    VariantLog.Free;
+    VariantLog := nil;
+  end;
+
   // PnPout.Add('],');
   // PnPout.Add('"Board":[');
 
-  Edges := '';
+  // Board edges: board shape (defined by the Board-Outline layer in current
+  // Altium versions), lines on the keep-out layer as fallback
+  Edges := ParseBoardOutlineGeneric(Board);
 
-  Count := 0;
-
-  Iter := Board.BoardIterator_Create;
-  Iter.AddFilter_LayerSet(MkSet(eKeepOutLayer));
-  Iter.AddFilter_ObjectSet(MkSet(eArcObject, eTrackObject));
-  Iter.AddFilter_Method(eProcessAll);
-  Prim := Iter.FirstPCBObject;
-  while (Prim <> nil) do
+  if Edges = '' then
   begin
-    Inc(Count);
-    If (Count > 1) Then
-      Edges := Edges + ', ';
+    Count := 0;
 
-    case (Prim.ObjectId) of
-      eArcObject:
-        begin
-          Edges := Edges + ParseArcGeneric(Board, Prim);
-        end;
-      eTrackObject:
-        begin
-          Edges := Edges + ParseTrackGeneric(Board, Prim, False);
-        end;
+    Iter := Board.BoardIterator_Create;
+    Iter.AddFilter_LayerSet(MkSet(eKeepOutLayer));
+    Iter.AddFilter_ObjectSet(MkSet(eArcObject, eTrackObject));
+    Iter.AddFilter_Method(eProcessAll);
+    Prim := Iter.FirstPCBObject;
+    while (Prim <> nil) do
+    begin
+      Inc(Count);
+      If (Count > 1) Then
+        Edges := Edges + ', ';
+
+      case (Prim.ObjectId) of
+        eArcObject:
+          begin
+            Edges := Edges + ParseArcGeneric(Board, Prim);
+          end;
+        eTrackObject:
+          begin
+            Edges := Edges + ParseTrackGeneric(Board, Prim, False);
+          end;
+      end;
+
+      Prim := Iter.NextPCBObject;
     end;
-
-    Prim := Iter.NextPCBObject;
+    Board.BoardIterator_Destroy(Iter);
   end;
-  Board.BoardIterator_Destroy(Iter);
   (*
     PnPout.Add('],');
     PnPout.Add('"BB":{');
@@ -2415,6 +2639,10 @@ Begin
 
   Count := 0;
   SelectedGroupParameters := GetSelectedGroupParameters(0);
+  // Components with different Design Item IDs are different parts and must
+  // never share a BOM line
+  if SelectedGroupParameters.IndexOf('[DesignItemID]') = -1 then
+    SelectedGroupParameters.Add('[DesignItemID]');
   for i := 0 to SelectedGroupParameters.Count - 1 do
   begin
     if Count > 0 then

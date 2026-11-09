@@ -9,6 +9,7 @@
 // the browser (see altium-variants.js).
 
 var ALTIUM_DEFAULT_GROUP_FIELDS = ["Value", "Footprint"];
+var ALTIUM_DESIGN_ITEM_ID = "Design Item ID";
 
 // Effective value of a field for a component in the given variant.
 function altiumGetField(comp, field, variantIndex) {
@@ -52,7 +53,11 @@ function altiumInBom(comp, variantIndex) {
 // with the DNP outline and leaves them out of the BOM table.
 function altiumBuildBom(data, config, altiumconfig, variantIndex) {
   var groupFields = (altiumconfig.group_fields && altiumconfig.group_fields.length) ?
-    altiumconfig.group_fields : ALTIUM_DEFAULT_GROUP_FIELDS;
+    altiumconfig.group_fields.slice() : ALTIUM_DEFAULT_GROUP_FIELDS.slice();
+  // Different Design Item IDs are different parts, never one BOM line
+  if (!groupFields.includes(ALTIUM_DESIGN_ITEM_ID)) {
+    groupFields.push(ALTIUM_DESIGN_ITEM_ID);
+  }
   var showFields = config.fields;
 
   var bom = {
